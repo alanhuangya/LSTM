@@ -144,6 +144,3 @@ https://github.com/chinese-poetry/chinese-poetry/tree/master/%E5%85%A8%E5%94%90%
 3. 可利用Pytorch搭建神经网络
 4. 初步理解神经网络结构RNN及LSTM
 
-## 署名
-
-22软工dqy

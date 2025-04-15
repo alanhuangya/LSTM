@@ -5,6 +5,7 @@ from torch.autograd import Variable
 
 # 模型构建一个LSTM层+一个Linear层
 class MyLstmModel(nn.Module):
+    # 定义模型
     def __init__(self, vocab_size, embedding_dim, hidden_dim, num_layers):
         super(MyLstmModel, self).__init__()
 

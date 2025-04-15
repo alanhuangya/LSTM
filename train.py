@@ -10,6 +10,7 @@ from mymodel_rnn import MyRnnModel
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+print("Using device: ", device)
 
 # 数据预处理的过程都是一样的
 def get_data_args(batch_size):

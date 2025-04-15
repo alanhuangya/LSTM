@@ -24,97 +24,113 @@ def load_model(file):
     _, hidden_dim, num_layers, _, _ = get_args()
     vocab_size, embedding_dim = w1.shape
 
+    # 在函数内部也明确设备，增加代码清晰度
+    current_device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"将在 {current_device} 设备上加载模型 '{file}'")  # 添加打印信息方便调试
+
     if file == './model/model_lstm':
-        # MyLstmModel(vocab_size, embedding_dim, hidden_dim, num_layers)
         model = MyLstmModel(vocab_size, embedding_dim, hidden_dim, num_layers)
-        # 实例化模型时
-        model.load_state_dict(torch.load(file))
-        # 设置为评估模式
-        model.eval()
+        # 使用 map_location 参数，这是推荐的加载模型到特定设备的方式
+        # weights_only=True 是为了安全和消除警告
+        model.load_state_dict(torch.load(file, map_location=current_device, weights_only=True))
+        model.eval()  # 设置为评估模式
+        # 再次显式移动，确保万无一失 (理论上 map_location 足够，但多一步更保险)
+        model = model.to(current_device)
+        print(f"模型 {file} 已移至 {next(model.parameters()).device}")  # 确认模型参数实际位置
         return model
 
     elif file == './model/model_rnn':
-        # MyRnnModel(vocab_size, embedding_dim, hidden_dim, num_layers)
         model = MyRnnModel(vocab_size, embedding_dim, hidden_dim, num_layers)
-        # 实例化模型时
-        model.load_state_dict(torch.load(file))
-        # 设置为评估模式
+        model.load_state_dict(torch.load(file, map_location=current_device, weights_only=True))
         model.eval()
+        model = model.to(current_device)
+        print(f"模型 {file} 已移至 {next(model.parameters()).device}")  # 确认模型参数实际位置
         return model
+
+    # 如果文件路径不匹配，可以返回 None 或抛出错误
+    return None
 
 
 # 输入单字，生成的诗句格式比较规定
 def generate_poem(model, input_char, max_length=31):
+    # --- 从模型自身获取最可靠的设备信息 ---
+    try:
+        model_device = next(model.parameters()).device
+        print(f"生成函数检测到模型位于: {model_device}")  # 调试信息
+    except StopIteration:
+        print("错误：无法从模型获取设备信息，模型可能为空或无参数。")
+        return "模型加载错误"
+    except AttributeError:
+        print(f"错误：传入的 'model' 不是一个有效的 PyTorch 模型: {model}")
+        return "模型类型错误"
+
     (w1, word_2_index, index_2_word) = pickle.load(open(vec_params_file, 'rb'))
 
     result = []
-    x_input = Variable(
-        torch.Tensor([word_2_index[input_char]]).view(1, 1).long())
+    # 检查输入字符是否在词汇表中
+    try:
+        initial_index = word_2_index[input_char]
+        if initial_index == -1:  # 假设 -1 表示未找到 (根据你之前的代码)
+            return "抱歉，词汇库中没有这个字。"
+    except KeyError:
+        # 如果字典里直接就没有这个key
+        return "抱歉，词汇库中没有这个字。"
 
-    x_input.to(device)
-    model.to(device)
+    # --- 直接在模型所在的设备上创建初始输入张量 ---
+    x_input = torch.tensor([[initial_index]], dtype=torch.long, device=model_device)
 
+    # 初始隐藏状态设为 None，让 LSTM/RNN 层在第一次调用时自行初始化（它们会在模型设备上创建）
     h_0 = None
     c_0 = None
-    word_index = word_2_index[input_char]
-    # is_punctuation = False
 
-    # 词汇表里没有这个字
-    if word_index == -1:
-        return "请换个字输入！"
-
-    # 先把字添加进去
+    # 先把有效的起始字加入结果
     result.append(input_char)
 
-    if isinstance(model, MyRnnModel):
-        for i in range(max_length):
-            pre, h_0 = model(x_input, h_0)
-            # word_index = int(torch.argmax(pre))
-            # top_index = pre.data[0].topk(1)[1][0]
-            top_7_probs, top_7_indices = torch.topk(pre[0], 7)
+    # --- 使用 torch.no_grad() 进行推理，可以节省显存并加速 ---
+    with torch.no_grad():
+        if isinstance(model, MyRnnModel):
+            for i in range(max_length):
+                # 确认输入和隐藏状态都在 model_device 上 (x_input 已保证, h_0 为 None 或来自上次输出)
+                pre, h_0 = model(x_input, h_0)  # 模型输出 pre, h_0 也会在 model_device 上
 
-            probs = f.softmax(pre, dim=1)[0]
-            top_7_probs = probs[top_7_indices]
-            top_index = random.choices(top_7_indices, weights=top_7_probs, k=1)[0]
-            pre_word = index_2_word[top_index.item()]
+                # --- 在 GPU 上进行采样 ---
+                # pre 的形状通常是 [1, vocab_size]
+                # 我们需要对 vocab_size 这个维度计算概率并采样
+                probs = f.softmax(pre[0], dim=0)  # 对第一个（也是唯一一个）batch的输出计算softmax
+                # 使用 multinomial 进行带权随机采样，直接在 GPU 上完成
+                next_token_tensor = torch.multinomial(probs, num_samples=1)  # 输出形状为 tensor([index])，仍在 model_device
 
-            result.append(pre_word)
-            x_input = Variable(x_input.data.new([top_index])).view(1, 1)
-        if len(result) < max_length:
-            return "请换个字输入！"
-        return ''.join(result)
+                # --- 处理采样结果 ---
+                # 从 GPU 张量获取 Python 整数索引 (需要 .item() 到 CPU)
+                current_index_val = next_token_tensor.item()
+                pre_word = index_2_word[current_index_val]
+                result.append(pre_word)
 
-    # 默认使用LSTM -> 同字生成的诗歌可能更多样一些
-    for i in range(max_length):
-        pre, (h_0, c_0) = model(x_input, h_0, c_0)
-        # word_index = int(torch.argmax(pre))
-        # top_index = pre.data[0].topk(1)[1][0]
+                # --- 准备下一次迭代的输入 ---
+                # 直接使用 GPU 上的采样结果 tensor，只需调整形状
+                # .view(1, 1) 或 .unsqueeze(0).unsqueeze(0) 都可以
+                x_input = next_token_tensor.view(1, 1)  # next_token_tensor 已经在 model_device 上了
 
-        # ——————————————————————————————————————————————————
-        # top_7_probs, top_7_indices = torch.topk(pre[0], 7)
-        #
-        # if result[-1] in ["，", "。"]:
-        #     # print("符号位")
-        #     probs = f.softmax(pre, dim=1)[0]
-        #     top_7_probs = probs[top_7_indices]
-        #     top_index = random.choices(top_7_indices, weights=top_7_probs, k=1)[0]
-        #     pre_word = index_2_word[top_index.item()]
-        # else:
-        #     top_index = pre.data[0].topk(1)[1][0]
-        #     pre_word = index_2_word[top_index.item()]
-        # ——————————————————————————————————————————————————
+        else:  # 默认是 LSTM
+            for i in range(max_length):
+                pre, (h_0, c_0) = model(x_input, h_0, c_0)  # 输入输出都在 model_device
 
-        top_7_probs, top_7_indices = torch.topk(pre[0], 7)
+                # --- 在 GPU 上采样 ---
+                probs = f.softmax(pre[0], dim=0)
+                next_token_tensor = torch.multinomial(probs, num_samples=1)  # 在 model_device
 
-        probs = f.softmax(pre, dim=1)[0]
-        top_7_probs = probs[top_7_indices]
-        top_index = random.choices(top_7_indices, weights=top_7_probs, k=1)[0]
-        pre_word = index_2_word[top_index.item()]
+                # --- 处理采样结果 ---
+                current_index_val = next_token_tensor.item()  # 转到 CPU 获取索引
+                pre_word = index_2_word[current_index_val]
+                result.append(pre_word)
 
-        result.append(pre_word)
-        x_input = Variable(x_input.data.new([top_index])).view(1, 1)
-    if len(result) < max_length:
-        return "请换个字输入！"
+                # --- 准备下一次迭代的输入 ---
+                x_input = next_token_tensor.view(1, 1)  # 复用 GPU 上的张量
+
+    # 检查是否生成了内容（至少要多于初始字符）
+    if len(result) <= 1:
+        return "生成失败或长度不足，请再试一次。"  # 提供更具体的反馈
+
     return ''.join(result)
 
 
